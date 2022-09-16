@@ -35,7 +35,7 @@ A partir de agora o tutorial vai considerar que você está trabalhando do diret
 
 ### Uma aplicação Flask pode ser tão simples quanto um arquivo.
 
->_hello.py_
+> _hello.py_
 ```python
 from flask import Flask
 
@@ -97,7 +97,7 @@ Uma aplicação Flask nada mais é do que uma instância da classe Flask. Todas 
 
 A forma mais direta de se criar uma aplicação em Flask é criando uma instância global no topo do código, assim como fizemos no arquivo ```hello.py```. Isso pode ser simples e útil, mas pode causar complicações conforme o projeto evolui.
 
-Ao invés de criar uma instância global, vamos criá-la dentro de uma função. Essa função é chamada de _Application Factory_, algo do tipo _fábrica da aplicação_, mas vamos apelidá-la de _Factory_ pra ficar mais fácil. Quaisquer configurações, registros ou outras definições devem ser feitos dentro desta função, e então a aplicação será retornada.
+Ao invés de criar uma instância global, vamos criá-la dentro de uma função. Essa função é chamada de _Application Factory_, ou _função construtora_. Quaisquer configurações, registros ou outras definições devem ser feitos dentro desta função, e então a aplicação será retornada.
 
 ### A tal da _Application Factory_
 
@@ -188,3 +188,149 @@ O retorno deve ser parecido com isso:
 Visite http://127.0.0.1:5000/hello num navegador que você verá a mensagem "Hello, World!". Parabéns, você está rodando sua aplicação Flask!
 
 > Se outra aplicação já estiver utilizando a porta 5000, você verá um erro ```OSError: [Errno 98]``` ou ```OSError: [WinError 10013]``` quando o servidor tenta iniciar. Veja a documentação sobre [endereço em uso](https://flask.palletsprojects.com/en/2.2.x/server/#address-already-in-use) para ver como lidar com isso (ou apenas para a outra aplicação, se não for gerar problema).
+
+## Definindo e acessando o Banco de Dados
+
+A aplicação vai usar um banco SQLite pra guardar usuários e posts. O próprio Python já tem suporte nativo pro SQLite com o módulo sqlite3.
+
+O SQLite é conveniente por não precisar de um banco rodando separado em outro servidor. Porém, se requisições concorrentes tentarem escrever ao mesmo tempo no banco, elas serão mais demoradas, pois cada escrita acontece individualmente. Pequenas aplicações não vão notar diferença. Conforme seu uso cresce, será melhor trocar para outro banco.
+
+> O tutorial não entra em detalhes sobre SQL. Se você não é familiar, a [documentação do SQLite](https://sqlite.org/lang.html) descreve bem a linguagem.
+
+### Conectando ao Banco de Dados
+
+A primeira coisa a se fazer quando se trabalha com SQLite (e várias outras bibliotecas de banco em Python) é criar uma conexão com ele. Quaisquer consultas e operações acontecem usando a conexão, que é fechada epois que o trabalho termina.
+
+Em aplicações web essas conexões são tipicamente amarradas à requisição. Ela é criada em algum ponto durante o processamento da requisição, e fechada antes da resposta ser enviada.
+
+> _flaskr/db.py_
+
+```python
+import sqlite3
+
+import click
+from flask import current_app, g
+
+
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(
+            current_app.config['DATABASE'],
+            detect_types=sqlite3.PARSE_DECLTYPES
+        )
+        g.db.row_factory = sqlite3.Row
+
+    return g.db
+
+
+def close_db(e=None):
+    db = g.pop('db', None)
+
+    if db is not None:
+        db.close()
+```
+
+```g``` é um objeto especial único para cda requisição. Ele é utilizado para guardar dados que poderão ser acessados por múltiplas funções durante a requisição. A conexão é criada e reutilizada, ao invés de de criar uma nova conexão sempre que ```get_db``` for chamada na mesma requisição.
+
+```current_app``` é outro objeto especial que aponta para a aplicação Flask que está lidando com a requisição. Uma vez que utilizamos uma função construtora, o objeto da aplicação não existe quando estamos escrevendo o resto do código. ```get_db``` será chamada depois que a aplicação já foi criada e está lidando com uma requisição, portanto ```current_app``` pode ser usado.
+
+```sqlite3.connect()``` estabelece uma conexão com o arquivo apontado pela chave de configuração ```DATABASE```. Este arquivo não precisa existir agora, e não irá, até que inicializemos o banco de dados mais à frente.
+
+```sqlite3.Row``` diz à conexão para retornar linhas que funcionam como dicionários. Isso nos permite acessar colunas por nome.
+
+```close_db``` checa se uma conexão foi criada conferindo se existe um ```g.db```. Se a conexão existe, é fechada. Mais à frente iremos mencionar ```close_db``` na função construtora, para que seja chamada após cada requisição.
+
+### Criando as tabelas
+
+No SQLite, os dados são guardados em _tabelas_ e _colunas_. Estes precisam ser criados antes que possamos guardar ou acessar dados. Flaskr irá salvar dados de usuários na tabela ```user```, e posts na tabela ```posts```. Criaremos um arquivo com os comandos SQL necessários para criar as tabelas vazias:
+
+> _flaskr/schema.sql_
+
+```sql
+DROP TABLE IF EXISTS user;
+DROP TABLE IF EXISTS post;
+
+CREATE TABLE user (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL
+);
+
+CREATE TABLE post (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  author_id INTEGER NOT NULL,
+  created TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  FOREIGN KEY (author_id) REFERENCES user (id)
+);
+```
+
+Agora vamos adicionar as funções que vão executar esses comandos SQL ao arquivo ```db.py```:
+
+> _flaskr/db.py_
+
+```python
+def init_db():
+    db = get_db()
+
+    with current_app.open_resource('schema.sql') as f:
+        db.executescript(f.read().decode('utf8'))
+
+
+@click.command('init-db')
+def init_db_command():
+    """Clear the existing data and create new tables."""
+    init_db()
+    click.echo('Initialized the database.')
+```
+
+```open_resource()``` abre um arquivo relativo ao pacote ```flaskr```, o que é útil já que nós não necessariamente saberemos onde fica isso quando fizermos _deploy_ da aplicação mais tarde. ```get_db``` retorna uma conexão com o banco de dados, que é usada para executar os comandos lidos no arquivo.
+
+```click.command()``` define um comando de linha de comando chamado ``ìnit-db```que chama a função ```init_db``` e mostra uma mensagem de sucesso para o usuário. Você pode consultar [Interface de Linha de Comando](https://flask.palletsprojects.com/en/2.2.x/cli/) para aprender mais sobre escrever seus próprios comandos.
+
+### Registrando com a aplicação
+
+As funções ```close_db``` e ```init_db_command``` precisam ser registradas na instância da aplicação; caso contrário, elas não serão usadas pela aplicação. Porém, como estamos usando uma função construtora, esta instãncia não está disponível quando estamos escrevendo as funções. Ao invés disso, criaremos uma função que recebe a aplicação como parâmetro e faz o registro.
+
+> _flaskr/db.py_
+
+```python
+def init_app(app):
+    app.teardown_appcontext(close_db)
+    app.cli.add_command(init_db_command)
+```
+
+```app.teardown_appcontext()``` diz ao Flask para chamar esta função depois que a requisição termina de ser processada, após retornar a resposta. 
+
+```app.cli.add_command()``` adiciona um novo comando que pode ser chamado no terminal com o comando ```flask```.
+
+Importe e chame essa função dentro da construtora. Coloque o novo código no fim da função construtora antes de retornar o app.
+
+> _flaskr/\_\_init\_\_.py_
+
+```python
+def create_app():
+    app = ...
+    # Código existente omitido
+
+    from . import db
+    db.init_app(app)
+
+    return app
+```
+
+### Inicie o arquivo de Banco de Dados
+
+Agora que ```init-db``` foi registrado no app, ele pode ser chamado usando o comando ```flask```, assim como o comando ```run``` usado anteriormente.
+
+> Se você ainda está rodando o servidor, você pode pará-lo agora, ou rodar esse comando em um novo terminal. Se você vai usar um novo terminal, não esqueça de entrar no diretório e ativar seu ambiente virtual, como descrito [aqui](https://flask.palletsprojects.com/en/2.2.x/installation/).
+
+Rode o comando ```init-db```:
+
+```bash
+$ flask --app flaskr init-db
+Initialized the database.
+```
+
+Um arquivo ```flaskr.sqlite``` será criado no diretório de instância do seu projeto.
